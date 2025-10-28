@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Emergency Rescue Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚨 Emergency Rescue Dashboard</h1>
+            <div class="status">
+                <div class="status-dot"></div>
+                <span>Live</span>
+            </div>
+        </div>
+
+        <div class="sidebar">
+            <div class="filters">
+                <div class="filter-buttons">
+                    <button class="filter-btn active" data-filter="all">All</button>
+                    <button class="filter-btn" data-filter="medical">Medical</button>
+                    <button class="filter-btn" data-filter="fire">Fire</button>
+                    <button class="filter-btn" data-filter="trapped">Trapped</button>
+                    <button class="filter-btn" data-filter="water">Water</button>
+                </div>
+            </div>
+            <div id="message-list-sidebar">
+                <div class="no-messages">Waiting for emergency messages...</div>
+            </div>
+        </div>
+
+        <div id="map"></div>
+    </div>
+
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+
+    <!-- Google Maps API -->
+    <!-- TODO: Replace YOUR_GOOGLE_MAPS_API_KEY with your actual API key -->
+    <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBdjFkTrndFOnF15dIyPAAKX0l-BWqspwY&callback=initMap" async defer></script>
+
+    <!-- Your Application Script -->
+    <script src="app.js"></script>
+</body>
+</html>
