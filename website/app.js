@@ -24,12 +24,70 @@ let map;
 let markers = [];
 let currentFilter = 'all';
 
+// Auto-delete messages older than 24 hours (in milliseconds)
+const MESSAGE_EXPIRY_TIME = 24 * 60 * 60 * 1000; // 24 hours
+
+// ============================================
+// AUTO-DELETE OLD MESSAGES
+// ============================================
+function cleanupOldMessages() {
+    const now = Date.now();
+    const cutoffTime = now - MESSAGE_EXPIRY_TIME;
+    
+    console.log('🧹 Checking for messages older than 24 hours...');
+    
+    const messagesRef = database.ref('messages');
+    
+    messagesRef.once('value', (snapshot) => {
+        const messages = snapshot.val();
+        
+        if (!messages) {
+            console.log('No messages to clean up.');
+            return;
+        }
+        
+        let deletedCount = 0;
+        const deletePromises = [];
+        
+        Object.keys(messages).forEach(messageId => {
+            const message = messages[messageId];
+            const messageTime = message.received_timestamp;
+            
+            // Check if message is older than 24 hours
+            if (messageTime < cutoffTime) {
+                console.log(`🗑️ Deleting old message: ${messageId} (${new Date(messageTime).toLocaleString()})`);
+                deletePromises.push(
+                    database.ref(`messages/${messageId}`).remove()
+                );
+                deletedCount++;
+            }
+        });
+        
+        if (deletedCount > 0) {
+            Promise.all(deletePromises).then(() => {
+                console.log(`✅ Deleted ${deletedCount} old message(s)`);
+            }).catch(error => {
+                console.error('❌ Error deleting messages:', error);
+            });
+        } else {
+            console.log('✅ No old messages found. All messages are within 24 hours.');
+        }
+    });
+}
+
+// Run cleanup when page loads
+cleanupOldMessages();
+
+// Run cleanup every hour automatically
+setInterval(cleanupOldMessages, 60 * 60 * 1000); // Check every hour
+
 // ============================================
 // GOOGLE MAPS INITIALIZATION
 // ============================================
 function initMap() {
     // Center on Bengaluru (disaster area - change as needed)
     map = new google.maps.Map(document.getElementById("map"), {
+        gestureHandling: 'greedy',  
         center: { lat: 12.9716, lng: 77.5946 },
         zoom: 12,
         styles: [
@@ -79,6 +137,16 @@ function listenForMessages() {
         const message = snapshot.val();
         const messageId = snapshot.key;
 
+        // Check if message is already expired (older than 24 hours)
+        const now = Date.now();
+        const messageAge = now - message.received_timestamp;
+        
+        if (messageAge > MESSAGE_EXPIRY_TIME) {
+            console.log(`⏰ Message ${messageId} is expired, deleting...`);
+            database.ref(`messages/${messageId}`).remove();
+            return; // Don't display expired messages
+        }
+
         // Parse coordinates
         const parts = message.location_string.split(',');
         const coords = {
@@ -95,7 +163,7 @@ function listenForMessages() {
             map: map,
             title: message.emergency_text,
             animation: google.maps.Animation.DROP,
-            icon: getMarkerIcon(emergencyType)
+            icon: message.team_deployed ? getDeployedMarkerIcon(emergencyType) : getMarkerIcon(emergencyType)
         });
 
         // Create info window
@@ -106,6 +174,12 @@ function listenForMessages() {
                     <p style="margin: 5px 0;"><strong>Message:</strong> ${message.emergency_text}</p>
                     <p style="margin: 5px 0;"><strong>Location:</strong> ${coords.lat.toFixed(4)}, ${coords.lng.toFixed(4)}</p>
                     <p style="margin: 5px 0;"><strong>Time:</strong> ${new Date(message.received_timestamp).toLocaleString()}</p>
+                    ${message.team_deployed ? 
+                        `<p style="margin: 5px 0; color: #22c55e;"><strong>✅ Team Deployed</strong></p>
+                         ${message.deployed_by ? `<p style="margin: 5px 0;"><strong>By:</strong> ${message.deployed_by}</p>` : ''}
+                         ${message.deployed_at ? `<p style="margin: 5px 0;"><strong>At:</strong> ${new Date(message.deployed_at).toLocaleTimeString()}</p>` : ''}` :
+                        '<p style="margin: 5px 0; color: #ef4444;"><strong>⚠️ Awaiting Response</strong></p>'
+                    }
                 </div>
             `
         });
@@ -129,15 +203,38 @@ function listenForMessages() {
         newCard.dataset.type = emergencyType;
         newCard.dataset.messageId = messageId;
         
+        // Check if team is already deployed
+        const isDeployed = message.team_deployed || false;
+        if (isDeployed) {
+            newCard.classList.add('deployed');
+        }
+        
+        // Add deployment status to dataset
+        newCard.dataset.deployed = isDeployed ? 'true' : 'false';
+        
         newCard.innerHTML = `
             <div class="message-text">${message.emergency_text}</div>
             <div class="message-meta">
                 <span class="message-badge badge-${emergencyType}">${emergencyType}</span>
                 <span>${new Date(message.received_timestamp).toLocaleTimeString()}</span>
             </div>
+            ${isDeployed ? 
+                `<div class="deployed-status">
+                    <span class="deployed-icon">✅</span> Team Deployed
+                    ${message.deployed_by ? `by ${message.deployed_by}` : ''}
+                    ${message.deployed_at ? `at ${new Date(message.deployed_at).toLocaleTimeString()}` : ''}
+                </div>` :
+                `<button class="deploy-btn" onclick="deployTeam('${messageId}')">
+                    🚁 Deploy Rescue Team
+                </button>`
+            }
         `;
 
-        newCard.addEventListener('click', () => {
+        newCard.addEventListener('click', (e) => {
+            // Don't pan if clicking the deploy button
+            if (e.target.classList.contains('deploy-btn')) {
+                return;
+            }
             map.panTo(coords);
             map.setZoom(15);
             infoWindow.open(map, marker);
@@ -154,6 +251,34 @@ function listenForMessages() {
 
         // Apply current filter
         applyFilter(currentFilter);
+    });
+
+    // Listen for removed messages
+    messagesRef.on('child_removed', (snapshot) => {
+        const messageId = snapshot.key;
+        console.log(`🗑️ Message removed: ${messageId}`);
+        
+        // Remove from sidebar
+        const card = document.querySelector(`[data-message-id="${messageId}"]`);
+        if (card) {
+            card.remove();
+        }
+        
+        // Remove marker from map
+        const markerIndex = markers.findIndex(m => m.messageId === messageId);
+        if (markerIndex !== -1) {
+            markers[markerIndex].marker.setMap(null); // Remove from map
+            markers.splice(markerIndex, 1); // Remove from array
+        }
+        
+        // Show "no messages" if list is empty
+        const listElement = document.getElementById('message-list-sidebar');
+        if (listElement.children.length === 0) {
+            const noMessages = document.createElement('div');
+            noMessages.className = 'no-messages';
+            noMessages.textContent = 'Waiting for emergency messages...';
+            listElement.appendChild(noMessages);
+        }
     });
 }
 
@@ -192,22 +317,104 @@ function getMarkerIcon(type) {
     };
 }
 
+function getDeployedMarkerIcon(type) {
+    return {
+        path: google.maps.SymbolPath.CIRCLE,
+        fillColor: '#22c55e',
+        fillOpacity: 0.9,
+        strokeColor: '#ffffff',
+        strokeWeight: 2,
+        scale: 8
+    };
+}
+
+function deployTeam(messageId) {
+    const teamName = prompt('Enter your rescue team name/ID:');
+    
+    if (!teamName || teamName.trim() === '') {
+        alert('Team name is required to deploy!');
+        return;
+    }
+
+    // Update Firebase with deployment info
+    const messageRef = database.ref(`messages/${messageId}`);
+    
+    messageRef.update({
+        team_deployed: true,
+        deployed_by: teamName.trim(),
+        deployed_at: Date.now()
+    }).then(() => {
+        alert(`✅ Team "${teamName}" has been deployed to this location!`);
+        
+        // Update the card in the UI
+        const card = document.querySelector(`[data-message-id="${messageId}"]`);
+        if (card) {
+            card.classList.add('deployed');
+            card.dataset.deployed = 'true';
+            
+            // Replace button with deployed status
+            const button = card.querySelector('.deploy-btn');
+            if (button) {
+                button.outerHTML = `
+                    <div class="deployed-status">
+                        <span class="deployed-icon">✅</span> Team Deployed by ${teamName}
+                        at ${new Date().toLocaleTimeString()}
+                    </div>
+                `;
+            }
+        }
+
+        // Update the marker color
+        const markerData = markers.find(m => m.messageId === messageId);
+        if (markerData) {
+            markerData.marker.setIcon(getDeployedMarkerIcon(markerData.type));
+            markerData.data.team_deployed = true;
+        }
+    }).catch(error => {
+        alert('❌ Error deploying team: ' + error.message);
+    });
+}
+
 function applyFilter(filterType) {
     currentFilter = filterType;
     
     // Filter sidebar cards
     const cards = document.querySelectorAll('.message-card');
     cards.forEach(card => {
-        if (filterType === 'all' || card.dataset.type === filterType) {
-            card.style.display = 'block';
+        const cardType = card.dataset.type;
+        const isDeployed = card.dataset.deployed === 'true';
+        
+        let shouldShow = false;
+        
+        if (filterType === 'all') {
+            shouldShow = true;
+        } else if (filterType === 'pending') {
+            shouldShow = !isDeployed;
+        } else if (filterType === 'deployed') {
+            shouldShow = isDeployed;
         } else {
-            card.style.display = 'none';
+            shouldShow = cardType === filterType;
         }
+        
+        card.style.display = shouldShow ? 'block' : 'none';
     });
 
     // Filter map markers
     markers.forEach(item => {
-        if (filterType === 'all' || item.type === filterType) {
+        const isDeployed = item.data.team_deployed || false;
+        let shouldShow = false;
+        
+        if (filterType === 'all') {
+            shouldShow = true;
+        } else if (filterType === 'pending') {
+            shouldShow = !isDeployed;
+        } else if (filterType === 'deployed') {
+            shouldShow = isDeployed;
+        } else {
+            shouldShow = item.type === filterType;
+        }
+        
+        if (shouldShow) {
             item.marker.setMap(map);
         } else {
             item.marker.setMap(null);
