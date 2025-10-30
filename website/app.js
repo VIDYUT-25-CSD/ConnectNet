@@ -28,6 +28,51 @@ let currentFilter = 'all';
 const MESSAGE_EXPIRY_TIME = 24 * 60 * 60 * 1000; // 24 hours
 
 // ============================================
+// GOOGLE MAPS INITIALIZATION
+// ============================================
+function initMap() {
+    // Center on Bengaluru (disaster area - change as needed)
+    map = new google.maps.Map(document.getElementById("map"), {
+        gestureHandling: 'greedy',  
+        center: { lat: 12.9716, lng: 77.5946 },
+        zoom: 12,
+        styles: [
+            { elementType: "geometry", stylers: [{ color: "#242f3e" }] },
+            { elementType: "labels.text.stroke", stylers: [{ color: "#242f3e" }] },
+            { elementType: "labels.text.fill", stylers: [{ color: "#746855" }] },
+            {
+                featureType: "administrative.locality",
+                elementType: "labels.text.fill",
+                stylers: [{ color: "#d59563" }]
+            },
+            {
+                featureType: "poi",
+                elementType: "labels.text.fill",
+                stylers: [{ color: "#d59563" }]
+            },
+            {
+                featureType: "road",
+                elementType: "geometry",
+                stylers: [{ color: "#38414e" }]
+            },
+            {
+                featureType: "road",
+                elementType: "geometry.stroke",
+                stylers: [{ color: "#212a37" }]
+            },
+            {
+                featureType: "water",
+                elementType: "geometry",
+                stylers: [{ color: "#17263c" }]
+            }
+        ]
+    });
+
+    // Start listening for messages after map is ready
+    listenForMessages();
+}
+
+// ============================================
 // AUTO-DELETE OLD MESSAGES
 // ============================================
 function cleanupOldMessages() {
@@ -80,51 +125,6 @@ cleanupOldMessages();
 
 // Run cleanup every hour automatically
 setInterval(cleanupOldMessages, 60 * 60 * 1000); // Check every hour
-
-// ============================================
-// GOOGLE MAPS INITIALIZATION
-// ============================================
-function initMap() {
-    // Center on Bengaluru (disaster area - change as needed)
-    map = new google.maps.Map(document.getElementById("map"), {
-        gestureHandling: 'greedy',  
-        center: { lat: 12.9716, lng: 77.5946 },
-        zoom: 12,
-        styles: [
-            { elementType: "geometry", stylers: [{ color: "#242f3e" }] },
-            { elementType: "labels.text.stroke", stylers: [{ color: "#242f3e" }] },
-            { elementType: "labels.text.fill", stylers: [{ color: "#746855" }] },
-            {
-                featureType: "administrative.locality",
-                elementType: "labels.text.fill",
-                stylers: [{ color: "#d59563" }]
-            },
-            {
-                featureType: "poi",
-                elementType: "labels.text.fill",
-                stylers: [{ color: "#d59563" }]
-            },
-            {
-                featureType: "road",
-                elementType: "geometry",
-                stylers: [{ color: "#38414e" }]
-            },
-            {
-                featureType: "road",
-                elementType: "geometry.stroke",
-                stylers: [{ color: "#212a37" }]
-            },
-            {
-                featureType: "water",
-                elementType: "geometry",
-                stylers: [{ color: "#17263c" }]
-            }
-        ]
-    });
-
-    // Start listening for messages after map is ready
-    listenForMessages();
-}
 
 // ============================================
 // FIREBASE REALTIME LISTENER
