@@ -1,8 +1,6 @@
 // ============================================
 // FIREBASE CONFIGURATION
 // ============================================
-// TODO: Replace with your Firebase config from Firebase Console
-// For Firebase JS SDK v7.20.0 and later, measurementId is optional
 const firebaseConfig = {
   apiKey: "AIzaSyAf053IXMKKznQhn0QTq1h3R-15LeJlTd4",
   authDomain: "connectnet-d7ea7.firebaseapp.com",
@@ -24,485 +22,420 @@ const database = firebase.database();
 let map;
 let markers = [];
 let currentFilter = 'all';
+let processedMessageIds = new Set();
 
-// Auto-delete messages older than 24 hours (in milliseconds)
-const MESSAGE_EXPIRY_TIME = 24 * 60 * 60 * 1000; // 24 hours
+// Auto-delete messages older than 24 hours
+const MESSAGE_EXPIRY_TIME = 24 * 60 * 60 * 1000;
+
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
+function detectEmergencyType(text) {
+  const lowerText = text.toLowerCase();
+  if (lowerText.includes('medical') || lowerText.includes('injured') || lowerText.includes('hurt')) {
+    return 'medical';
+  } else if (lowerText.includes('fire') || lowerText.includes('burning')) {
+    return 'fire';
+  } else if (lowerText.includes('trapped') || lowerText.includes('stuck') || lowerText.includes('buried')) {
+    return 'trapped';
+  } else if (lowerText.includes('water') || lowerText.includes('flood') || lowerText.includes('drowning')) {
+    return 'water';
+  }
+  return 'medical';
+}
+
+function getMarkerIcon(type) {
+  const colors = {
+    medical: '#ef4444',
+    fire: '#f97316',
+    trapped: '#eab308',
+    water: '#3b82f6'
+  };
+  return {
+    path: google.maps.SymbolPath.CIRCLE,
+    fillColor: colors[type],
+    fillOpacity: 0.9,
+    strokeColor: '#ffffff',
+    strokeWeight: 2,
+    scale: 8
+  };
+}
+
+function getDeployedMarkerIcon() {
+  return {
+    path: google.maps.SymbolPath.CIRCLE,
+    fillColor: '#22c55e',
+    fillOpacity: 0.9,
+    strokeColor: '#ffffff',
+    strokeWeight: 2,
+    scale: 8
+  };
+}
 
 // ============================================
 // AUTO-DELETE OLD MESSAGES
 // ============================================
 function cleanupOldMessages() {
-    const now = Date.now();
-    const cutoffTime = now - MESSAGE_EXPIRY_TIME;
-    
-    console.log('🧹 Checking for messages older than 24 hours...');
-    
-    const messagesRef = database.ref('messages');
-    
-    messagesRef.once('value', (snapshot) => {
-        const messages = snapshot.val();
-        
-        if (!messages) {
-            console.log('No messages to clean up.');
-            return;
-        }
-        
-        let deletedCount = 0;
-        const deletePromises = [];
-        
-        Object.keys(messages).forEach(messageId => {
-            const message = messages[messageId];
-            const messageTime = message.received_timestamp;
-            
-            // Check if message is older than 24 hours
-            if (messageTime < cutoffTime) {
-                console.log(`🗑️ Deleting old message: ${messageId} (${new Date(messageTime).toLocaleString()})`);
-                deletePromises.push(
-                    database.ref(`messages/${messageId}`).remove()
-                );
-                deletedCount++;
-            }
-        });
-        
-        if (deletedCount > 0) {
-            Promise.all(deletePromises).then(() => {
-                console.log(`✅ Deleted ${deletedCount} old message(s)`);
-            }).catch(error => {
-                console.error('❌ Error deleting messages:', error);
-            });
-        } else {
-            console.log('✅ No old messages found. All messages are within 24 hours.');
-        }
+  const now = Date.now();
+  const cutoffTime = now - MESSAGE_EXPIRY_TIME;
+
+  console.log('🧹 Checking for messages older than 24 hours...');
+  const messagesRef = database.ref('messages');
+
+  messagesRef.once('value', (snapshot) => {
+    const messages = snapshot.val();
+    if (!messages) {
+      console.log('No messages to clean up.');
+      return;
+    }
+
+    let deletedCount = 0;
+    const deletePromises = [];
+    const seenOriginalIds = new Set();
+
+    Object.keys(messages).forEach(messageId => {
+      const message = messages[messageId];
+      const messageTime = message.received_timestamp;
+
+      if (messageTime < cutoffTime) {
+        console.log(`🗑️ Deleting old message: ${messageId}`);
+        deletePromises.push(database.ref(`messages/${messageId}`).remove());
+        deletedCount++;
+      } else if (seenOriginalIds.has(message.original_message_id)) {
+        console.log(`🗑️ Deleting duplicate message: ${messageId}`);
+        deletePromises.push(database.ref(`messages/${messageId}`).remove());
+        deletedCount++;
+      } else {
+        seenOriginalIds.add(message.original_message_id);
+      }
     });
+
+    if (deletedCount > 0) {
+      Promise.all(deletePromises).then(() => {
+        console.log(`✅ Deleted ${deletedCount} old/duplicate message(s)`);
+      }).catch(error => console.error('❌ Error deleting messages:', error));
+    } else {
+      console.log('✅ No old or duplicate messages found.');
+    }
+  });
 }
 
-// Run cleanup when page loads
-cleanupOldMessages();
-
-// Run cleanup every hour automatically
-setInterval(cleanupOldMessages, 60 * 60 * 1000); // Check every hour
-
 // ============================================
-// GOOGLE MAPS INITIALIZATION
+// DEPLOYMENT HANDLER
 // ============================================
-function initMap() {
-    // Center on Bengaluru (disaster area - change as needed)
-    map = new google.maps.Map(document.getElementById("map"), {
-        center: { lat: 12.9716, lng: 77.5946 },
-        zoom: 12,
-        gestureHandling: 'greedy',
-        styles: [
-            { elementType: "geometry", stylers: [{ color: "#242f3e" }] },
-            { elementType: "labels.text.stroke", stylers: [{ color: "#242f3e" }] },
-            { elementType: "labels.text.fill", stylers: [{ color: "#746855" }] },
-            {
-                featureType: "administrative.locality",
-                elementType: "labels.text.fill",
-                stylers: [{ color: "#d59563" }]
-            },
-            {
-                featureType: "poi",
-                elementType: "labels.text.fill",
-                stylers: [{ color: "#d59563" }]
-            },
-            {
-                featureType: "road",
-                elementType: "geometry",
-                stylers: [{ color: "#38414e" }]
-            },
-            {
-                featureType: "road",
-                elementType: "geometry.stroke",
-                stylers: [{ color: "#212a37" }]
-            },
-            {
-                featureType: "water",
-                elementType: "geometry",
-                stylers: [{ color: "#17263c" }]
-            }
-        ]
-    });
+function deployTeam(messageId) {
+  const teamName = prompt('Enter your rescue team name/ID:');
+  if (!teamName || teamName.trim() === '') {
+    alert('Team name is required to deploy!');
+    return;
+  }
 
-    // Start listening for messages after map is ready
-    listenForMessages();
+  const messageRef = database.ref(`messages/${messageId}`);
+  messageRef.update({
+    team_deployed: true,
+    deployed_by: teamName.trim(),
+    deployed_at: Date.now()
+  }).then(() => {
+    alert(`✅ Team "${teamName}" has been deployed!`);
+    const card = document.querySelector(`[data-message-id="${messageId}"]`);
+    if (card) {
+      card.classList.add('deployed');
+      card.dataset.deployed = 'true';
+      const button = card.querySelector('.deploy-btn');
+      if (button) {
+        button.outerHTML = `
+          <div class="deployed-status">
+            <span class="deployed-icon">✅</span> Team Deployed by ${teamName}
+            at ${new Date().toLocaleTimeString()}
+          </div>
+        `;
+      }
+    }
+    const markerData = markers.find(m => m.messageId === messageId);
+    if (markerData) {
+      markerData.marker.setIcon(getDeployedMarkerIcon());
+      markerData.data.team_deployed = true;
+    }
+  }).catch(error => alert('❌ Error deploying team: ' + error.message));
 }
 
 // ============================================
 // FIREBASE REALTIME LISTENER
 // ============================================
 function listenForMessages() {
-    const messagesRef = database.ref('messages');
+  const messagesRef = database.ref('messages');
+  const listElement = document.getElementById('message-list-sidebar');
+
+  messagesRef.on('child_added', (snapshot) => {
+    const message = snapshot.val();
+    const messageId = snapshot.key;
+
+    // Check for duplicates FIRST
+    if (processedMessageIds.has(message.original_message_id)) {
+      console.log(`⚠️ Duplicate detected: ${message.original_message_id}, deleting...`);
+      database.ref(`messages/${messageId}`).remove();
+      return;
+    }
+    processedMessageIds.add(message.original_message_id);
+
+    // Check expiry
+    const now = Date.now();
+    if (now - message.received_timestamp > MESSAGE_EXPIRY_TIME) {
+      console.log(`⏰ Expired message ${messageId}, deleting...`);
+      processedMessageIds.delete(message.original_message_id);
+      database.ref(`messages/${messageId}`).remove();
+      return;
+    }
+
+    const [lat, lng] = message.location_string.split(',').map(parseFloat);
+    const coords = { lat, lng };
+    const emergencyType = detectEmergencyType(message.emergency_text);
+
+    const marker = new google.maps.Marker({
+      position: coords,
+      map: map,
+      title: message.emergency_text,
+      animation: google.maps.Animation.DROP,
+      icon: message.team_deployed ? getDeployedMarkerIcon() : getMarkerIcon(emergencyType)
+    });
+
+    const infoWindow = new google.maps.InfoWindow({
+      content: `
+        <div style="color:#333; padding:5px;">
+          <h3 style="color:#667eea; margin:0 0 10px 0;">Emergency Alert</h3>
+          <p style="margin:5px 0;"><strong>Message:</strong> ${message.emergency_text}</p>
+          <p style="margin:5px 0;"><strong>Location:</strong> ${coords.lat.toFixed(4)}, ${coords.lng.toFixed(4)}</p>
+          <p style="margin:5px 0;"><strong>Time:</strong> ${new Date(message.received_timestamp).toLocaleString()}</p>
+          ${message.team_deployed
+            ? `<p style="margin:5px 0; color:#22c55e;"><strong>✅ Team Deployed</strong></p>
+               ${message.deployed_by ? `<p style="margin:5px 0;"><strong>By:</strong> ${message.deployed_by}</p>` : ''}`
+            : `<p style="margin:5px 0; color:#ef4444;"><strong>⚠️ Awaiting Response</strong></p>`
+          }
+        </div>
+      `
+    });
+
+    marker.addListener('click', () => infoWindow.open(map, marker));
+
+    markers.push({ marker, type: emergencyType, coords, messageId, data: message });
+
+    const newCard = document.createElement('div');
+    newCard.className = `message-card ${emergencyType}`;
+    newCard.dataset.type = emergencyType;
+    newCard.dataset.messageId = messageId;
+    newCard.dataset.deployed = message.team_deployed ? 'true' : 'false';
+    if (message.team_deployed) newCard.classList.add('deployed');
+
+    newCard.innerHTML = `
+      <div class="message-text">${message.emergency_text}</div>
+      <div class="message-meta">
+        <span class="message-badge badge-${emergencyType}">${emergencyType}</span>
+        <span>${new Date(message.received_timestamp).toLocaleTimeString()}</span>
+      </div>
+      ${message.team_deployed
+        ? `<div class="deployed-status">
+             <span class="deployed-icon">✅</span> Team Deployed
+             ${message.deployed_by ? `by ${message.deployed_by}` : ''}
+             ${message.deployed_at ? `at ${new Date(message.deployed_at).toLocaleTimeString()}` : ''}
+           </div>`
+        : `<button class="deploy-btn" onclick="deployTeam('${messageId}')">🚁 Deploy Rescue Team</button>`
+      }
+    `;
+
+    newCard.addEventListener('click', (e) => {
+      if (e.target.classList.contains('deploy-btn')) return;
+      if (window.innerWidth <= 768) switchToMapView();
+      map.panTo(coords);
+      map.setZoom(15);
+      infoWindow.open(map, marker);
+    });
+
+    const noMessages = listElement.querySelector('.no-messages');
+    if (noMessages) noMessages.remove();
+    listElement.prepend(newCard);
+
+    applyFilter(currentFilter);
+  });
+
+  messagesRef.on('child_removed', (snapshot) => {
+    const messageId = snapshot.key;
+    const message = snapshot.val();
+    console.log(`🗑️ Message removed: ${messageId}`);
+
+    if (message && message.original_message_id) {
+      processedMessageIds.delete(message.original_message_id);
+    }
+
+    const card = document.querySelector(`[data-message-id="${messageId}"]`);
+    if (card) card.remove();
+
+    const markerIndex = markers.findIndex(m => m.messageId === messageId);
+    if (markerIndex !== -1) {
+      markers[markerIndex].marker.setMap(null);
+      markers.splice(markerIndex, 1);
+    }
+
     const listElement = document.getElementById('message-list-sidebar');
-
-    messagesRef.on('child_added', (snapshot) => {
-        const message = snapshot.val();
-        const messageId = snapshot.key;
-
-        // Check if message is already expired (older than 24 hours)
-        const now = Date.now();
-        const messageAge = now - message.received_timestamp;
-        
-        if (messageAge > MESSAGE_EXPIRY_TIME) {
-            console.log(`⏰ Message ${messageId} is expired, deleting...`);
-            database.ref(`messages/${messageId}`).remove();
-            return; // Don't display expired messages
-        }
-
-        // Parse coordinates
-        const parts = message.location_string.split(',');
-        const coords = {
-            lat: parseFloat(parts[0]),
-            lng: parseFloat(parts[1])
-        };
-
-        // Detect emergency type
-        const emergencyType = detectEmergencyType(message.emergency_text);
-
-        // Create map marker
-        const marker = new google.maps.Marker({
-            position: coords,
-            map: map,
-            title: message.emergency_text,
-            animation: google.maps.Animation.DROP,
-            icon: message.team_deployed ? getDeployedMarkerIcon(emergencyType) : getMarkerIcon(emergencyType)
-        });
-
-        // Create info window
-        const infoWindow = new google.maps.InfoWindow({
-            content: `
-                <div style="color: #333; padding: 5px;">
-                    <h3 style="margin: 0 0 10px 0; color: #667eea;">Emergency Alert</h3>
-                    <p style="margin: 5px 0;"><strong>Message:</strong> ${message.emergency_text}</p>
-                    <p style="margin: 5px 0;"><strong>Location:</strong> ${coords.lat.toFixed(4)}, ${coords.lng.toFixed(4)}</p>
-                    <p style="margin: 5px 0;"><strong>Time:</strong> ${new Date(message.received_timestamp).toLocaleString()}</p>
-                    ${message.team_deployed ? 
-                        `<p style="margin: 5px 0; color: #22c55e;"><strong>✅ Team Deployed</strong></p>
-                         ${message.deployed_by ? `<p style="margin: 5px 0;"><strong>By:</strong> ${message.deployed_by}</p>` : ''}
-                         ${message.deployed_at ? `<p style="margin: 5px 0;"><strong>At:</strong> ${new Date(message.deployed_at).toLocaleTimeString()}</p>` : ''}` :
-                        '<p style="margin: 5px 0; color: #ef4444;"><strong>⚠️ Awaiting Response</strong></p>'
-                    }
-                </div>
-            `
-        });
-
-        marker.addListener('click', () => {
-            infoWindow.open(map, marker);
-        });
-
-        // Store marker with metadata
-        markers.push({
-            marker: marker,
-            type: emergencyType,
-            coords: coords,
-            messageId: messageId,
-            data: message
-        });
-
-        // Create sidebar card
-        const newCard = document.createElement('div');
-        newCard.className = `message-card ${emergencyType}`;
-        newCard.dataset.type = emergencyType;
-        newCard.dataset.messageId = messageId;
-        
-        // Check if team is already deployed
-        const isDeployed = message.team_deployed || false;
-        if (isDeployed) {
-            newCard.classList.add('deployed');
-        }
-        
-        // Add deployment status to dataset
-        newCard.dataset.deployed = isDeployed ? 'true' : 'false';
-        
-        newCard.innerHTML = `
-            <div class="message-text">${message.emergency_text}</div>
-            <div class="message-meta">
-                <span class="message-badge badge-${emergencyType}">${emergencyType}</span>
-                <span>${new Date(message.received_timestamp).toLocaleTimeString()}</span>
-            </div>
-            ${isDeployed ? 
-                `<div class="deployed-status">
-                    <span class="deployed-icon">✅</span> Team Deployed
-                    ${message.deployed_by ? `by ${message.deployed_by}` : ''}
-                    ${message.deployed_at ? `at ${new Date(message.deployed_at).toLocaleTimeString()}` : ''}
-                </div>` :
-                `<button class="deploy-btn" onclick="deployTeam('${messageId}')">
-                    🚁 Deploy Rescue Team
-                </button>`
-            }
-        `;
-
-        newCard.addEventListener('click', (e) => {
-            // Don't pan if clicking the deploy button
-            if (e.target.classList.contains('deploy-btn')) {
-                return;
-            }
-            
-            // On mobile, switch to map view when clicking a message
-            if (window.innerWidth <= 768) {
-                switchToMapView();
-            }
-            
-            map.panTo(coords);
-            map.setZoom(15);
-            infoWindow.open(map, marker);
-        });
-
-        // Remove "no messages" placeholder
-        const noMessages = listElement.querySelector('.no-messages');
-        if (noMessages) {
-            noMessages.remove();
-        }
-
-        // Add to top of list
-        listElement.prepend(newCard);
-
-        // Apply current filter
-        applyFilter(currentFilter);
-    });
-
-    // Listen for removed messages
-    messagesRef.on('child_removed', (snapshot) => {
-        const messageId = snapshot.key;
-        console.log(`🗑️ Message removed: ${messageId}`);
-        
-        // Remove from sidebar
-        const card = document.querySelector(`[data-message-id="${messageId}"]`);
-        if (card) {
-            card.remove();
-        }
-        
-        // Remove marker from map
-        const markerIndex = markers.findIndex(m => m.messageId === messageId);
-        if (markerIndex !== -1) {
-            markers[markerIndex].marker.setMap(null); // Remove from map
-            markers.splice(markerIndex, 1); // Remove from array
-        }
-        
-        // Show "no messages" if list is empty
-        const listElement = document.getElementById('message-list-sidebar');
-        if (listElement.children.length === 0) {
-            const noMessages = document.createElement('div');
-            noMessages.className = 'no-messages';
-            noMessages.textContent = 'Waiting for emergency messages...';
-            listElement.appendChild(noMessages);
-        }
-    });
+    if (listElement.children.length === 0) {
+      const noMessages = document.createElement('div');
+      noMessages.className = 'no-messages';
+      noMessages.textContent = 'Waiting for emergency messages...';
+      listElement.appendChild(noMessages);
+    }
+  });
 }
 
 // ============================================
-// HELPER FUNCTIONS
+// MAP INITIALIZATION (Called by Google Maps)
 // ============================================
-function detectEmergencyType(text) {
-    const lowerText = text.toLowerCase();
-    if (lowerText.includes('medical') || lowerText.includes('injured') || lowerText.includes('hurt')) {
-        return 'medical';
-    } else if (lowerText.includes('fire') || lowerText.includes('burning')) {
-        return 'fire';
-    } else if (lowerText.includes('trapped') || lowerText.includes('stuck') || lowerText.includes('buried')) {
-        return 'trapped';
-    } else if (lowerText.includes('water') || lowerText.includes('flood') || lowerText.includes('drowning')) {
-        return 'water';
-    }
-    return 'medical'; // default
+function initMap() {
+  console.log('🗺️ Initializing map...');
+  
+  map = new google.maps.Map(document.getElementById("map"), {
+    center: { lat: 12.9716, lng: 77.5946 },
+    zoom: 12,
+    gestureHandling: 'greedy',
+    styles: [
+      { elementType: "geometry", stylers: [{ color: "#242f3e" }] },
+      { elementType: "labels.text.stroke", stylers: [{ color: "#242f3e" }] },
+      { elementType: "labels.text.fill", stylers: [{ color: "#746855" }] },
+      {
+        featureType: "administrative.locality",
+        elementType: "labels.text.fill",
+        stylers: [{ color: "#d59563" }]
+      },
+      {
+        featureType: "poi",
+        elementType: "labels.text.fill",
+        stylers: [{ color: "#d59563" }]
+      },
+      {
+        featureType: "road",
+        elementType: "geometry",
+        stylers: [{ color: "#38414e" }]
+      },
+      {
+        featureType: "road",
+        elementType: "geometry.stroke",
+        stylers: [{ color: "#212a37" }]
+      },
+      {
+        featureType: "water",
+        elementType: "geometry",
+        stylers: [{ color: "#17263c" }]
+      }
+    ]
+  });
+
+  console.log('✅ Map initialized');
+  
+  // Start listening for messages AFTER map is ready
+  listenForMessages();
+  
+  // Run cleanup after everything is initialized
+  cleanupOldMessages();
+  
+  // Schedule periodic cleanup
+  setInterval(cleanupOldMessages, 60 * 60 * 1000);
 }
 
-function getMarkerIcon(type) {
-    const colors = {
-        medical: '#ef4444',
-        fire: '#f97316',
-        trapped: '#eab308',
-        water: '#3b82f6'
-    };
-    
-    return {
-        path: google.maps.SymbolPath.CIRCLE,
-        fillColor: colors[type],
-        fillOpacity: 0.9,
-        strokeColor: '#ffffff',
-        strokeWeight: 2,
-        scale: 8
-    };
-}
+// Make initMap globally accessible for Google Maps callback
+window.initMap = initMap;
 
-function getDeployedMarkerIcon(type) {
-    return {
-        path: google.maps.SymbolPath.CIRCLE,
-        fillColor: '#22c55e',
-        fillOpacity: 0.9,
-        strokeColor: '#ffffff',
-        strokeWeight: 2,
-        scale: 8
-    };
-}
-
-function deployTeam(messageId) {
-    const teamName = prompt('Enter your rescue team name/ID:');
-    
-    if (!teamName || teamName.trim() === '') {
-        alert('Team name is required to deploy!');
-        return;
-    }
-
-    // Update Firebase with deployment info
-    const messageRef = database.ref(`messages/${messageId}`);
-    
-    messageRef.update({
-        team_deployed: true,
-        deployed_by: teamName.trim(),
-        deployed_at: Date.now()
-    }).then(() => {
-        alert(`✅ Team "${teamName}" has been deployed to this location!`);
-        
-        // Update the card in the UI
-        const card = document.querySelector(`[data-message-id="${messageId}"]`);
-        if (card) {
-            card.classList.add('deployed');
-            card.dataset.deployed = 'true';
-            
-            // Replace button with deployed status
-            const button = card.querySelector('.deploy-btn');
-            if (button) {
-                button.outerHTML = `
-                    <div class="deployed-status">
-                        <span class="deployed-icon">✅</span> Team Deployed by ${teamName}
-                        at ${new Date().toLocaleTimeString()}
-                    </div>
-                `;
-            }
-        }
-
-        // Update the marker color
-        const markerData = markers.find(m => m.messageId === messageId);
-        if (markerData) {
-            markerData.marker.setIcon(getDeployedMarkerIcon(markerData.type));
-            markerData.data.team_deployed = true;
-        }
-    }).catch(error => {
-        alert('❌ Error deploying team: ' + error.message);
-    });
-}
-
+// ============================================
+// FILTER & VIEW HANDLING
+// ============================================
 function applyFilter(filterType) {
-    currentFilter = filterType;
-    
-    // Filter sidebar cards
-    const cards = document.querySelectorAll('.message-card');
-    cards.forEach(card => {
-        const cardType = card.dataset.type;
-        const isDeployed = card.dataset.deployed === 'true';
-        
-        let shouldShow = false;
-        
-        if (filterType === 'all') {
-            shouldShow = true;
-        } else if (filterType === 'pending') {
-            shouldShow = !isDeployed;
-        } else if (filterType === 'deployed') {
-            shouldShow = isDeployed;
-        } else {
-            shouldShow = cardType === filterType;
-        }
-        
-        card.style.display = shouldShow ? 'block' : 'none';
-    });
-
-    // Filter map markers
-    markers.forEach(item => {
-        const isDeployed = item.data.team_deployed || false;
-        let shouldShow = false;
-        
-        if (filterType === 'all') {
-            shouldShow = true;
-        } else if (filterType === 'pending') {
-            shouldShow = !isDeployed;
-        } else if (filterType === 'deployed') {
-            shouldShow = isDeployed;
-        } else {
-            shouldShow = item.type === filterType;
-        }
-        
-        if (shouldShow) {
-            item.marker.setMap(map);
-        } else {
-            item.marker.setMap(null);
-        }
-    });
+  currentFilter = filterType;
+  
+  document.querySelectorAll('.message-card').forEach(card => {
+    const type = card.dataset.type;
+    const deployed = card.dataset.deployed === 'true';
+    let show = false;
+    if (filterType === 'all') show = true;
+    else if (filterType === 'pending') show = !deployed;
+    else if (filterType === 'deployed') show = deployed;
+    else show = type === filterType;
+    card.style.display = show ? 'block' : 'none';
+  });
+  
+  markers.forEach(m => {
+    const deployed = m.data.team_deployed || false;
+    let show = false;
+    if (filterType === 'all') show = true;
+    else if (filterType === 'pending') show = !deployed;
+    else if (filterType === 'deployed') show = deployed;
+    else show = m.type === filterType;
+    m.marker.setMap(show ? map : null);
+  });
 }
 
-// ============================================
-// MOBILE VIEW SWITCHING FUNCTIONS
-// ============================================
 function switchToMapView() {
-    const sidebar = document.querySelector('.sidebar');
-    const mapElement = document.getElementById('map');
-    const toggleButtons = document.querySelectorAll('.toggle-btn');
-    
-    sidebar.classList.remove('active');
-    mapElement.style.display = 'block';
-    
-    // Update toggle buttons
-    toggleButtons.forEach(btn => {
-        if (btn.dataset.view === 'map') {
-            btn.classList.add('active');
-        } else {
-            btn.classList.remove('active');
-        }
-    });
-    
-    // Trigger map resize
-    if (map) {
-        setTimeout(() => {
-            google.maps.event.trigger(map, 'resize');
-        }, 100);
+  const sidebar = document.querySelector('.sidebar');
+  const mapElement = document.getElementById('map');
+  const toggleButtons = document.querySelectorAll('.toggle-btn');
+  
+  sidebar.classList.remove('active');
+  mapElement.style.display = 'block';
+  
+  toggleButtons.forEach(btn => {
+    if (btn.dataset.view === 'map') {
+      btn.classList.add('active');
+    } else {
+      btn.classList.remove('active');
     }
+  });
+  
+  if (map) {
+    setTimeout(() => google.maps.event.trigger(map, 'resize'), 100);
+  }
 }
 
 function switchToMessagesView() {
-    const sidebar = document.querySelector('.sidebar');
-    const mapElement = document.getElementById('map');
-    const toggleButtons = document.querySelectorAll('.toggle-btn');
-    
-    sidebar.classList.add('active');
-    mapElement.style.display = 'none';
-    
-    // Update toggle buttons
-    toggleButtons.forEach(btn => {
-        if (btn.dataset.view === 'messages') {
-            btn.classList.add('active');
-        } else {
-            btn.classList.remove('active');
-        }
-    });
+  const sidebar = document.querySelector('.sidebar');
+  const mapElement = document.getElementById('map');
+  const toggleButtons = document.querySelectorAll('.toggle-btn');
+  
+  sidebar.classList.add('active');
+  mapElement.style.display = 'none';
+  
+  toggleButtons.forEach(btn => {
+    if (btn.dataset.view === 'messages') {
+      btn.classList.add('active');
+    } else {
+      btn.classList.remove('active');
+    }
+  });
 }
 
 // ============================================
-// FILTER BUTTON HANDLERS & MOBILE TOGGLE
+// DOM READY - Initialize UI Elements
 // ============================================
 document.addEventListener('DOMContentLoaded', () => {
-    // Filter buttons
-    document.querySelectorAll('.filter-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            applyFilter(btn.dataset.filter);
-        });
-    });
+  console.log('📱 DOM loaded, initializing UI...');
 
-    // Mobile toggle functionality
-    const toggleButtons = document.querySelectorAll('.toggle-btn');
-    
-    toggleButtons.forEach(btn => {
-        btn.addEventListener('click', () => {
-            const view = btn.dataset.view;
-            console.log('Toggle clicked:', view); // Debug log
-            
-            if (view === 'messages') {
-                switchToMessagesView();
-            } else {
-                switchToMapView();
-            }
-        });
+  // Filter buttons
+  document.querySelectorAll('.filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      applyFilter(btn.dataset.filter);
     });
-    
-    console.log('Mobile toggle initialized'); // Debug log
+  });
+
+  // Mobile toggle buttons
+  document.querySelectorAll('.toggle-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const view = btn.dataset.view;
+      console.log('📱 Toggle clicked:', view);
+      if (view === 'messages') {
+        switchToMessagesView();
+      } else {
+        switchToMapView();
+      }
+    });
+  });
+
+  console.log('✅ UI initialization complete');
+  console.log('⏳ Waiting for Google Maps to load...');
 });
