@@ -28,20 +28,46 @@ let processedMessageIds = new Set();
 const MESSAGE_EXPIRY_TIME = 24 * 60 * 60 * 1000;
 
 // ============================================
+// MESSAGE FORMAT NORMALIZATION
+// ============================================
+function normalizeMessage(message, firebaseKey = null) {
+  const normalized = {
+    original_message_id: message.original_message_id || message.uid || firebaseKey || `fallback-${Date.now()}`,
+    emergency_text: message.emergency_text || message.payloadEncrypted || 'Emergency alert',
+    location_string: message.location_string || 
+      (message.latitude && message.longitude ? `${message.latitude},${message.longitude}` : '12.9716,77.5946'),
+    received_timestamp: message.received_timestamp || message.timestamp || Date.now(),
+    type: message.type || detectEmergencyTypeFromText(message.emergency_text || message.payloadEncrypted || ''),
+    team_deployed: message.team_deployed || false,
+    deployed_by: message.deployed_by || null,
+    deployed_at: message.deployed_at || null
+  };
+  return normalized;
+}
+
+// ============================================
 // HELPER FUNCTIONS
 // ============================================
-function detectEmergencyType(text) {
+function detectEmergencyTypeFromText(text) {
   const lowerText = text.toLowerCase();
-  if (lowerText.includes('medical') || lowerText.includes('injured') || lowerText.includes('hurt')) {
+  if (lowerText.includes('medical') || lowerText.includes('injured') || lowerText.includes('hurt') || lowerText.includes('bleeding')) {
     return 'medical';
-  } else if (lowerText.includes('fire') || lowerText.includes('burning')) {
+  } else if (lowerText.includes('fire') || lowerText.includes('burning') || lowerText.includes('smoke')) {
     return 'fire';
-  } else if (lowerText.includes('trapped') || lowerText.includes('stuck') || lowerText.includes('buried')) {
+  } else if (lowerText.includes('trapped') || lowerText.includes('stuck') || lowerText.includes('buried') || lowerText.includes('collapse')) {
     return 'trapped';
-  } else if (lowerText.includes('water') || lowerText.includes('flood') || lowerText.includes('drowning')) {
+  } else if (lowerText.includes('water') || lowerText.includes('flood') || lowerText.includes('drowning') || lowerText.includes('river')) {
     return 'water';
   }
   return 'medical';
+}
+
+function detectEmergencyType(normalizedMessage) {
+  if (normalizedMessage.type) {
+    const type = normalizedMessage.type.toLowerCase();
+    if (['medical', 'fire', 'trapped', 'water'].includes(type)) return type;
+  }
+  return detectEmergencyTypeFromText(normalizedMessage.emergency_text);
 }
 
 function getMarkerIcon(type) {
@@ -53,7 +79,7 @@ function getMarkerIcon(type) {
   };
   return {
     path: google.maps.SymbolPath.CIRCLE,
-    fillColor: colors[type],
+    fillColor: colors[type] || '#ef4444',
     fillOpacity: 0.9,
     strokeColor: '#ffffff',
     strokeWeight: 2,
@@ -73,7 +99,7 @@ function getDeployedMarkerIcon() {
 }
 
 // ============================================
-// AUTO-DELETE OLD MESSAGES
+// AUTO-DELETE OLD MESSAGES (SAFE VERSION)
 // ============================================
 function cleanupOldMessages() {
   const now = Date.now();
@@ -94,29 +120,27 @@ function cleanupOldMessages() {
     const seenOriginalIds = new Set();
 
     Object.keys(messages).forEach(messageId => {
-      const message = messages[messageId];
-      const messageTime = message.received_timestamp;
+      const rawMessage = messages[messageId];
+      const message = normalizeMessage(rawMessage, messageId);
+      let messageTime = Number(message.received_timestamp);
+
+      if (isNaN(messageTime)) return; // skip invalid
+      if (messageTime < 10000000000) messageTime *= 1000; // seconds → ms
 
       if (messageTime < cutoffTime) {
-        console.log(`🗑️ Deleting old message: ${messageId}`);
-        deletePromises.push(database.ref(`messages/${messageId}`).remove());
-        deletedCount++;
-      } else if (seenOriginalIds.has(message.original_message_id)) {
-        console.log(`🗑️ Deleting duplicate message: ${messageId}`);
-        deletePromises.push(database.ref(`messages/${messageId}`).remove());
-        deletedCount++;
+        console.log(`🧹 Skipping old message: ${messageId} (${new Date(messageTime).toLocaleString()})`);
+        return;
+      }
+
+      if (seenOriginalIds.has(message.original_message_id)) {
+        console.log(`🗑️ Duplicate message skipped: ${messageId} (ID: ${message.original_message_id})`);
+        return;
       } else {
         seenOriginalIds.add(message.original_message_id);
       }
     });
 
-    if (deletedCount > 0) {
-      Promise.all(deletePromises).then(() => {
-        console.log(`✅ Deleted ${deletedCount} old/duplicate message(s)`);
-      }).catch(error => console.error('❌ Error deleting messages:', error));
-    } else {
-      console.log('✅ No old or duplicate messages found.');
-    }
+    if (deletedCount === 0) console.log('✅ No old/duplicate deletions performed (safe cleanup).');
   });
 }
 
@@ -160,36 +184,47 @@ function deployTeam(messageId) {
 }
 
 // ============================================
-// FIREBASE REALTIME LISTENER
+// FIREBASE REALTIME LISTENER (SAFE VERSION)
 // ============================================
 function listenForMessages() {
   const messagesRef = database.ref('messages');
   const listElement = document.getElementById('message-list-sidebar');
 
   messagesRef.on('child_added', (snapshot) => {
-    const message = snapshot.val();
+    const rawMessage = snapshot.val();
     const messageId = snapshot.key;
 
-    // Check for duplicates FIRST
+    console.log('📨 New message received:', messageId, rawMessage);
+
+    const message = normalizeMessage(rawMessage, messageId);
+    console.log('📨 Normalized message:', message);
+
+    // ✅ Normalize timestamp
+    let messageTime = Number(message.received_timestamp);
+    if (isNaN(messageTime)) messageTime = Date.now();
+    else if (messageTime < 10000000000) messageTime *= 1000;
+    message.received_timestamp = messageTime;
+
+    // ✅ Expiry check (skip only)
+    const now = Date.now();
+    if (now - message.received_timestamp > MESSAGE_EXPIRY_TIME) {
+      console.log(`⏰ Skipping expired message ${messageId} (${new Date(message.received_timestamp)})`);
+      return;
+    }
+
+    // ✅ Duplicate check (skip only)
     if (processedMessageIds.has(message.original_message_id)) {
-      console.log(`⚠️ Duplicate detected: ${message.original_message_id}, deleting...`);
-      database.ref(`messages/${messageId}`).remove();
+      console.log(`⚠️ Skipping duplicate: ${message.original_message_id}`);
       return;
     }
     processedMessageIds.add(message.original_message_id);
 
-    // Check expiry
-    const now = Date.now();
-    if (now - message.received_timestamp > MESSAGE_EXPIRY_TIME) {
-      console.log(`⏰ Expired message ${messageId}, deleting...`);
-      processedMessageIds.delete(message.original_message_id);
-      database.ref(`messages/${messageId}`).remove();
-      return;
-    }
-
+    // Parse coordinates
     const [lat, lng] = message.location_string.split(',').map(parseFloat);
     const coords = { lat, lng };
-    const emergencyType = detectEmergencyType(message.emergency_text);
+    const emergencyType = detectEmergencyType(message);
+
+    console.log(`✅ Displaying message: ${emergencyType} at ${coords.lat}, ${coords.lng}`);
 
     const marker = new google.maps.Marker({
       position: coords,
@@ -203,20 +238,18 @@ function listenForMessages() {
       content: `
         <div style="color:#333; padding:5px;">
           <h3 style="color:#667eea; margin:0 0 10px 0;">Emergency Alert</h3>
-          <p style="margin:5px 0;"><strong>Message:</strong> ${message.emergency_text}</p>
-          <p style="margin:5px 0;"><strong>Location:</strong> ${coords.lat.toFixed(4)}, ${coords.lng.toFixed(4)}</p>
-          <p style="margin:5px 0;"><strong>Time:</strong> ${new Date(message.received_timestamp).toLocaleString()}</p>
+          <p><strong>Message:</strong> ${message.emergency_text}</p>
+          <p><strong>Location:</strong> ${coords.lat.toFixed(4)}, ${coords.lng.toFixed(4)}</p>
+          <p><strong>Time:</strong> ${new Date(message.received_timestamp).toLocaleString()}</p>
           ${message.team_deployed
-            ? `<p style="margin:5px 0; color:#22c55e;"><strong>✅ Team Deployed</strong></p>
-               ${message.deployed_by ? `<p style="margin:5px 0;"><strong>By:</strong> ${message.deployed_by}</p>` : ''}`
-            : `<p style="margin:5px 0; color:#ef4444;"><strong>⚠️ Awaiting Response</strong></p>`
-          }
+            ? `<p style="color:#22c55e;"><strong>✅ Team Deployed</strong></p>
+               ${message.deployed_by ? `<p><strong>By:</strong> ${message.deployed_by}</p>` : ''}`
+            : `<p style="color:#ef4444;"><strong>⚠️ Awaiting Response</strong></p>`}
         </div>
       `
     });
 
     marker.addListener('click', () => infoWindow.open(map, marker));
-
     markers.push({ marker, type: emergencyType, coords, messageId, data: message });
 
     const newCard = document.createElement('div');
@@ -238,8 +271,7 @@ function listenForMessages() {
              ${message.deployed_by ? `by ${message.deployed_by}` : ''}
              ${message.deployed_at ? `at ${new Date(message.deployed_at).toLocaleTimeString()}` : ''}
            </div>`
-        : `<button class="deploy-btn" onclick="deployTeam('${messageId}')">🚁 Deploy Rescue Team</button>`
-      }
+        : `<button class="deploy-btn" onclick="deployTeam('${messageId}')">🚁 Deploy Rescue Team</button>`}
     `;
 
     newCard.addEventListener('click', (e) => {
@@ -259,10 +291,11 @@ function listenForMessages() {
 
   messagesRef.on('child_removed', (snapshot) => {
     const messageId = snapshot.key;
-    const message = snapshot.val();
+    const rawMessage = snapshot.val();
     console.log(`🗑️ Message removed: ${messageId}`);
 
-    if (message && message.original_message_id) {
+    if (rawMessage) {
+      const message = normalizeMessage(rawMessage, messageId);
       processedMessageIds.delete(message.original_message_id);
     }
 
@@ -286,11 +319,10 @@ function listenForMessages() {
 }
 
 // ============================================
-// MAP INITIALIZATION (Called by Google Maps)
+// MAP INITIALIZATION
 // ============================================
 function initMap() {
   console.log('🗺️ Initializing map...');
-  
   map = new google.maps.Map(document.getElementById("map"), {
     center: { lat: 12.9716, lng: 77.5946 },
     zoom: 12,
@@ -298,48 +330,16 @@ function initMap() {
     styles: [
       { elementType: "geometry", stylers: [{ color: "#242f3e" }] },
       { elementType: "labels.text.stroke", stylers: [{ color: "#242f3e" }] },
-      { elementType: "labels.text.fill", stylers: [{ color: "#746855" }] },
-      {
-        featureType: "administrative.locality",
-        elementType: "labels.text.fill",
-        stylers: [{ color: "#d59563" }]
-      },
-      {
-        featureType: "poi",
-        elementType: "labels.text.fill",
-        stylers: [{ color: "#d59563" }]
-      },
-      {
-        featureType: "road",
-        elementType: "geometry",
-        stylers: [{ color: "#38414e" }]
-      },
-      {
-        featureType: "road",
-        elementType: "geometry.stroke",
-        stylers: [{ color: "#212a37" }]
-      },
-      {
-        featureType: "water",
-        elementType: "geometry",
-        stylers: [{ color: "#17263c" }]
-      }
+      { elementType: "labels.text.fill", stylers: [{ color: "#746855" }] }
     ]
   });
 
   console.log('✅ Map initialized');
-  
-  // Start listening for messages AFTER map is ready
   listenForMessages();
-  
-  // Run cleanup after everything is initialized
   cleanupOldMessages();
-  
-  // Schedule periodic cleanup
   setInterval(cleanupOldMessages, 60 * 60 * 1000);
 }
 
-// Make initMap globally accessible for Google Maps callback
 window.initMap = initMap;
 
 // ============================================
@@ -358,7 +358,7 @@ function applyFilter(filterType) {
     else show = type === filterType;
     card.style.display = show ? 'block' : 'none';
   });
-  
+
   markers.forEach(m => {
     const deployed = m.data.team_deployed || false;
     let show = false;
@@ -377,18 +377,10 @@ function switchToMapView() {
   
   sidebar.classList.remove('active');
   mapElement.style.display = 'block';
-  
   toggleButtons.forEach(btn => {
-    if (btn.dataset.view === 'map') {
-      btn.classList.add('active');
-    } else {
-      btn.classList.remove('active');
-    }
+    btn.classList.toggle('active', btn.dataset.view === 'map');
   });
-  
-  if (map) {
-    setTimeout(() => google.maps.event.trigger(map, 'resize'), 100);
-  }
+  if (map) setTimeout(() => google.maps.event.trigger(map, 'resize'), 100);
 }
 
 function switchToMessagesView() {
@@ -398,23 +390,16 @@ function switchToMessagesView() {
   
   sidebar.classList.add('active');
   mapElement.style.display = 'none';
-  
   toggleButtons.forEach(btn => {
-    if (btn.dataset.view === 'messages') {
-      btn.classList.add('active');
-    } else {
-      btn.classList.remove('active');
-    }
+    btn.classList.toggle('active', btn.dataset.view === 'messages');
   });
 }
 
 // ============================================
-// DOM READY - Initialize UI Elements
+// DOM READY
 // ============================================
 document.addEventListener('DOMContentLoaded', () => {
   console.log('📱 DOM loaded, initializing UI...');
-
-  // Filter buttons
   document.querySelectorAll('.filter-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
@@ -422,20 +407,14 @@ document.addEventListener('DOMContentLoaded', () => {
       applyFilter(btn.dataset.filter);
     });
   });
-
-  // Mobile toggle buttons
   document.querySelectorAll('.toggle-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const view = btn.dataset.view;
       console.log('📱 Toggle clicked:', view);
-      if (view === 'messages') {
-        switchToMessagesView();
-      } else {
-        switchToMapView();
-      }
+      if (view === 'messages') switchToMessagesView();
+      else switchToMapView();
     });
   });
-
   console.log('✅ UI initialization complete');
   console.log('⏳ Waiting for Google Maps to load...');
 });
